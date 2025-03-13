@@ -20,21 +20,40 @@
 ;*  Internal Register Definitions and Constants
 ;***********************************************************
 .def    mpr = r16               ; Multi-Purpose Register
-.def	stat = r17
+.def	stat = r17				; 0: ReadyFlag 1: ___ 2: ____ 3: _____ 4: ____ 5: ___ 6: ___ 7:____ 
 .def	choice = r18
+.def	opponent = r19
+.def	waitcnt = r20				; Wait Loop Counter
+.def	temp = r25
 
-.def	waitcnt = r17				; Wait Loop Counter
+
+
+//Just for wait function
 .def	ilcnt = r18				; Inner Loop Counter
 .def	olcnt = r19				; Outer Loop Counter
+
+
 
 .equ	But7 = 7				; Right Whisker Input Bit
 .equ	But2 = 4				; Left Whisker Input Bit
 .equ	WTime = 150				; Time to wait in wait loop
 .def	i = r25
 
+.equ	is_ready = 0			
+
 .equ	Rock = 1
 .equ	Paper = 2
 .equ	Scissors = 3
+
+
+;***********************************************************
+;*  Preload Value = 0x48E5
+;*  Prescaler = 256 => timer increment time = 256/8MHz = 32 micro seconds
+;*  => total timer count to get 1.5 secs = 1.5/ 32 microsec = 46875
+;*  => Preload value = 65536 - 46875 = 18661 = 0x48E5
+;***********************************************************
+.equ PRELOAD_HIGH = 0x48       ; High byte of preload value
+.equ PRELOAD_LOW  = 0xE5       ; Low byte of preload value
 
 ; Use this signal code between two boards for their game ready
 .equ    SendReady = 0b11111111
@@ -56,7 +75,7 @@
     push    ZH
     push    XH
     push    XL
-    push    r16
+    push    r15
     push    r17  ; Used as loop counter	
 	
 
@@ -98,7 +117,15 @@ WRD_LOOP:
 ;***********************************************************
 .org    $0000                   ; Beginning of IVs
 	    rjmp    INIT            	; Reset interrupt
-		
+
+
+.org	$0028
+	rcall TIMER1_INT
+	reti
+.org	$0032
+	rcall	USART_Receive		; USART1, Rx complete interrupt
+	reti
+
 
 .org    $0056                   ; End of Interrupt Vectors
 
@@ -126,21 +153,21 @@ INIT:
 	out		PORTD, mpr		; so all Port D inputs are Tri-State
 
 	
-	;USART1
-		ldi		mpr, (1 << U2X1)
-		sts		UCSR1A, mpr
-		;Set baudrate at 2400bps
-		ldi     mpr, high(0x01A0)	; Set Baud Rate to 2400 bps
-		sts     UBRR1H, mpr			; Double-Speed => divider becomes 8
-		ldi		mpr, low(0x01A0)	; Look at Slide 96 in Chap 5
-		sts		UBRR1L, mpr
-		;Enable receiver and transmitter
-		ldi     mpr, (1 << UCSZ11) | (1 << UCSZ10) | (1 << USBS1)
-		sts     UCSR1C, mpr
+;USART1
+	ldi		mpr, (1 << U2X1)
+	sts		UCSR1A, mpr
+	;Set baudrate at 2400bps
+	ldi     mpr, high(0x01A0)	; Set Baud Rate to 2400 bps
+	sts     UBRR1H, mpr			; Double-Speed => divider becomes 8
+	ldi		mpr, low(0x01A0)	; Look at Slide 96 in Chap 5
+	sts		UBRR1L, mpr
+	;Enable receiver and transmitter
+	ldi     mpr, (1 << RXEN1) | (1 << TXEN1) | (1 << RXCIE1)
+	sts     UCSR1B, mpr
 
-		;Set frame format: 8 data bits, 2 stop bits
-		ldi     mpr, (1 << UCSZ11) | (1 << UCSZ10) | (1 << USBS1)
-		sts     UCSR1C, mpr
+	;Set frame format: 8 data bits, 2 stop bits
+	ldi     mpr, (1 << UCSZ11) | (1 << UCSZ10) | (1 << USBS1)
+	sts     UCSR1C, mpr
 
 
 	;TIMER/COUNTER1
@@ -149,6 +176,17 @@ INIT:
 		sts		TCCR1A, mpr
 		ldi		mpr, (1 << CS12)	; Prescaler = 256
 		sts		TCCR1B, mpr
+
+		ldi     mpr, PRELOAD_HIGH      ; Load high byte of preload value
+		sts     TCNT1H, mpr
+		ldi     mpr, PRELOAD_LOW       ; Load low byte of preload value
+		sts     TCNT1L, mpr
+
+		ldi     mpr, (1 << TOIE1)      ; Enable Timer1 Overflow Interrupt
+		sts     TIMSK1, mpr
+
+		SEI
+
 	;Other
 
 	// Initialize the LCD
@@ -156,11 +194,13 @@ INIT:
 
 		//load string from memory to SRAM
 		WORD_TO_MEM  Welcome_START, Line1, 32
-		ldi choice, 2
+		ldi choice, 1 // Start with ROCK
+		ldi opponent, 3 // TEst
 
 		//Write to the screen from loaded memory
 		rcall LCDWrite
-
+		
+		
 
 
 ;***********************************************************
@@ -169,13 +209,12 @@ INIT:
 MAIN:
 
 	;TODO: ???
+		WORD_TO_MEM  Welcome_START, Line1, 32
+		ldi choice, 1 // Start with ROCK
 		in		mpr, PIND		; Get Button input from Port D
 		sbrs	mpr, BUT7		; If left button is high skip next
-		rcall START
-
-		
+		rjmp	START
 		//rcall Word_To_Data
-		rcall LCDWrite
 		rjmp	MAIN
 
 ;***********************************************************
@@ -190,46 +229,94 @@ MAIN:
 ;		for the number of clock cycles in the wait loop:
 ;			(((((3*ilcnt)-1+4)*olcnt)-1+4)*waitcnt)-1+16
 ;----------------------------------------------------------------
-Wait:
-		push	waitcnt			; Save wait register
-		push	ilcnt			; Save ilcnt register
-		push	olcnt			; Save olcnt register
+HALF_SECOND_WAIT:
+    push waitcnt
+    push olcnt
+    push ilcnt
 
-Loop:	ldi		olcnt, 224		; load olcnt register
-OLoop:	ldi		ilcnt, 237		; load ilcnt register
-ILoop:	dec		ilcnt			; decrement ilcnt
-		brne	ILoop			; Continue Inner Loop
-		dec		olcnt		; decrement olcnt
-		brne	OLoop			; Continue Outer Loop
-		dec		waitcnt		; Decrement wait
-		brne	Loop			; Continue Wait loop
+    ldi waitcnt, 100         ; 50 iterations of ~10ms each = 500ms
+HWAIT_OUTER:
+    ldi olcnt, 40           ; Outer loop (~10ms per iteration)
+HWAIT_LOOP:
+    ldi ilcnt, 200          ; Inner loop for short delay
+HWAIT_INNER:
+    dec ilcnt
+    brne HWAIT_INNER
+    dec olcnt
+    brne HWAIT_LOOP
+    dec waitcnt
+    brne HWAIT_OUTER       ; Repeat outer loop until 500ms is reached
 
-		pop		olcnt		; Restore olcnt register
-		pop		ilcnt		; Restore ilcnt register
-		pop		waitcnt		; Restore wait register
-		ret				; Return from subroutine
+    pop ilcnt
+    pop olcnt
+    pop waitcnt
+    ret
+
+
+;***********************************************************
+;*  USART Communication
+;***********************************************************
+USART_Send:
+	lds		mpr, UCSR1A
+	sbrs	mpr, UDRE1
+	rjmp	USART_Send
+	sts		UDR1, choice
+	ret
+
+USART_Receive:
+	lds		mpr, UCSR1A
+	sbrs	mpr, RXC1
+	rjmp	USART_Receive
+	lds		opponent, UDR1
+	ret	
+
+
+STANDBY:
+    WORD_TO_MEM Standby_START, Line1, 32  ; Display "Ready, Waiting"
+
+    ; Send "Ready" signal
+    ldi     mpr, SendReady         ; Load the ready signal
+    sts     UDR1, mpr              ; Send via USART
+
+STANDBY_LOOP:
+    lds     mpr, UCSR1A            ; Load USART1 Status Register
+    sbrs    mpr, RXC1              ; Check if data is received
+    rjmp    STANDBY_LOOP           ; If no data received, loop
+
+    ; Receive opponent's ready signal
+    rcall   USART_Receive          
+    cpi     opponent, SendReady    ; Check if opponent sent "ready"
+    brne    STANDBY_LOOP           ; If not, keep waiting
+
+    rjmp    START                  ; Both boards are ready ? Start the game
+
 
 
 
 START:
 	WORD_TO_MEM Game_Start, Line1, 16
+	rcall START_TIMER
+CHOICE_LOOP:
 	in		mpr, PIND		; Get Button input from Port D
 	sbrs	mpr, but2		; If Right button is high skip next
 	rcall	EDIT_CHOICE		; increment speed and do operation
+
 	cpi		CHOICE, 1
 	BREQ	DISPLAY_ROCK
 	cpi		CHOICE, 2
 	BREQ	DISPLAY_PAPER
 	cpi		CHOICE, 3
 	BREQ	DISPLAY_SCISSORS
-	push	waitcnt
-	ldi		waitcnt, WTime
-	rcall	WAIT
-	pop		waitcnt
+ 
+ AFTER_CHOICE:
 
+	IN		mpr, PINB
+	ANDI	mpr, $F0
+	
+	sbrc	mpr, 4
+	rjmp	CHOICE_LOOP
 
-	rjmp START
-
+	rjmp GAME_LOGIC
 
 
 EDIT_CHOICE:
@@ -241,23 +328,183 @@ EDIT_CHOICE:
 DISPLAY_ROCK:
 		WORD_TO_MEM Rock_Start, Line2, 16
 		rcall LCDWrite
-		rjmp START
+		rcall HALF_SECOND_WAIT  ; Wait 500ms to prevent bouncing
+
+		rjmp  AFTER_CHOICE
 
 DISPLAY_PAPER:
 		WORD_TO_MEM PAPER_Start, Line2, 16
 		rcall LCDWrite
-		rjmp START
+		rcall HALF_SECOND_WAIT  ; Wait 500ms to prevent bouncing
+
+
+		rjmp  AFTER_CHOICE
 
 DISPLAY_SCISSORS:
 		WORD_TO_MEM Scissors_Start, Line2, 16
 		rcall LCDWrite
-		rjmp START
+		rcall HALF_SECOND_WAIT  ; Wait to prevent bouncing
+
+		rjmp  AFTER_CHOICE
 
 
 
 
 
 
+
+
+
+
+
+
+START_TIMER:
+	push	mpr
+    ldi     waitcnt, 4          ; Set countdown to 4 steps (4 LEDs)
+	ldi		STAT, $00
+
+    ; Load preload value
+    ldi     mpr, PRELOAD_HIGH
+    sts     TCNT1H, mpr
+    ldi     mpr, PRELOAD_LOW
+    sts     TCNT1L, mpr
+
+    ; Enable Timer1 Overflow Interrupt
+    ldi     mpr, (1 << TOIE1)
+    sts     TIMSK1, mpr
+
+	IN		mpr, PORTB
+	ANDI	mpr, $0F
+	ORI		mpr, $F0
+	OUT		PORTB, mpr
+
+	pop		mpr
+    ret
+
+
+TIMER1_INT:
+    push    mpr
+    push    temp
+
+    in      mpr, PORTB             ; Read current LED state from PORTB (output register)
+    andi    mpr, 0xF0              ; Keep only PB7:PB4 (LEDs), clear PB3:PB0
+    mov     temp, mpr              ; Copy the LED bits to temp
+    lsr     temp                   ; Shift LEDs right (turn off one LED)
+    andi    temp, 0xF0              ; Ensure only PB7:PB4 are modified
+    in      mpr, PORTB             ; Read PORTB again to get PB3:PB0
+    andi    mpr, 0x0F              ; Mask PB3:PB0 (keep lower nibble)
+    or      mpr, temp               ; Merge shifted LEDs with preserved PB3:PB0
+    out     PORTB, mpr              ; Update PORTB with new LED state
+
+    ; Decrement countdown counter
+    ; Check if countdown is complete
+	andi	mpr, $F0
+    CPI		mpr, 0
+    brne    TIMER_CONTINUE          ; If not zero, continue countdown
+
+    ; Disable Timer1 Interrupt
+    ldi     mpr, 0x00
+    sts     TIMSK1, mpr
+	ldi		stat, $FF
+    rjmp    END_TIMER
+
+
+TIMER_CONTINUE:
+    ; Keep the timer running
+    ldi     mpr, PRELOAD_HIGH
+    sts     TCNT1H, mpr
+    ldi     mpr, PRELOAD_LOW
+    sts     TCNT1L, mpr
+	
+
+END_TIMER:
+
+    pop     temp
+    pop     mpr
+    ret
+
+
+
+GAME_LOGIC:	
+	sub  choice, opponent  ; choice - opponent
+	brpl MODULO            ; If result is positive, go to MODULO
+	ldi opponent, 3
+	add  choice, opponent        ; If negative, adjust by adding 3
+
+MODULO:
+	cpi  choice, 1
+	breq DISPLAY_WIN
+
+	cpi  choice, 2
+	breq DISPLAY_LOSE
+
+	rjmp DISPLAY_TIE
+
+
+
+DISPLAY_TIE:
+		rcall START_TIMER
+TIE_LOOP:
+		WORD_TO_MEM Draw_Start, Line1, 16
+		rcall LCDWrite
+
+		IN		mpr, PINB
+		ANDI	mpr, $F0
+		sbrc	mpr, 4
+		rjmp TIE_LOOP
+
+		rjmp restart_game
+
+
+DISPLAY_WIN:
+    rcall START_TIMER
+WIN_LOOP:
+    WORD_TO_MEM Win_Start, Line1, 16
+    rcall LCDWrite
+			
+	IN		mpr, PINB
+	ANDI	mpr, $F0
+	sbrc	mpr, 4
+    rjmp    WIN_LOOP
+
+    rjmp    RESTART_GAME
+
+
+DISPLAY_LOSE:
+    rcall START_TIMER
+LOSE_LOOP:
+    WORD_TO_MEM Lose_Start, Line1, 16
+    rcall LCDWrite
+
+	IN		mpr, PINB
+	ANDI	mpr, $F0
+	sbrc	mpr, 4
+    rjmp    LOSE_LOOP
+
+    rjmp    RESTART_GAME
+
+
+
+RESTART_GAME:
+    ; Clear game variables
+    ldi     choice, 1
+    ldi     opponent, 1
+    clr     stat
+    clr     waitcnt
+
+    ; Reset LEDs
+    ldi     mpr, 0x00     ; Turn off all LEDs
+    out     PORTB, mpr
+	
+    ; Reset LCD with welcome message
+    WORD_TO_MEM Welcome_START, Line1, 32
+    rcall   LCDWrite
+
+    ; Reset the Ready Flag
+    clr     stat
+
+    ; Jump back to main loop
+    jmp    MAIN
 
 ;***********************************************************
 ;*	Stored Program Data
@@ -273,8 +520,8 @@ Welcome_START:
 Welcome_END:
 
 Standby_START:
-    .DB		"Welcome!        "		; Declaring data in ProgMem
-	.DB		"Please Press PD7"
+    .DB		"Ready, Waiting  "		; Declaring data in ProgMem
+	.DB		"For the Opponent"
 Standby_END:
 
 Game_Start:
@@ -293,7 +540,17 @@ Scissors_Start:
 	.DB		"Scissors        "
 Scissors_END:
 
+Win_Start:
+    .DB		"You Won!!       "		; Declaring data in ProgMem
+Win_END:
 
+Lose_Start:
+	.DB		"You Lost        "
+Lose_END:
+
+Draw_Start:
+	.DB		"Draw!           "
+Draw_END:
 
 
 
@@ -306,7 +563,7 @@ Line1:
 //Split the bottom string in half for counters
 Line2: 
 	.byte 16
-
+		
 
 ;***********************************************************
 ;*	Additional Program Includes

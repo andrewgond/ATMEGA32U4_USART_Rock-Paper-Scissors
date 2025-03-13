@@ -20,13 +20,16 @@
 ;*  Internal Register Definitions and Constants
 ;***********************************************************
 .def    mpr = r16               ; Multi-Purpose Register
-.def	stat = r17				; 0: ReadyFlag 1: ___ 2: ____ 3: _____ 4: ____ 5: ___ 6: ___ 7:____ 
+;.def	stat = r17				; 0: ReadyFlag 1: ___ 2: ____ 3: _____ 4: ____ 5: ___ 6: ___ 7:____ 
 .def	choice = r18
 .def	opponent = r19
 .def	waitcnt = r20				; Wait Loop Counter
 .def	temp = r25
 
 
+//USART THingys
+.def	send = r18
+.def	receive = r19
 
 //Just for wait function
 .def	ilcnt = r18				; Inner Loop Counter
@@ -122,10 +125,8 @@ WRD_LOOP:
 .org	$0028
 	rcall TIMER1_INT
 	reti
-.org	$0032
-	rcall	USART_Receive		; USART1, Rx complete interrupt
-	reti
-
+.org    $0032
+    rjmp    USART_Receive_Interrupt   ; Jump to the ISR when data is received
 
 .org    $0056                   ; End of Interrupt Vectors
 
@@ -185,7 +186,7 @@ INIT:
 		ldi     mpr, (1 << TOIE1)      ; Enable Timer1 Overflow Interrupt
 		sts     TIMSK1, mpr
 
-		SEI
+		sei
 
 	;Other
 
@@ -209,11 +210,11 @@ INIT:
 MAIN:
 
 	;TODO: ???
-		WORD_TO_MEM  Welcome_START, Line1, 32
+		//WORD_TO_MEM  Welcome_START, Line1, 32
 		ldi choice, 1 // Start with ROCK
 		in		mpr, PIND		; Get Button input from Port D
 		sbrs	mpr, BUT7		; If left button is high skip next
-		rjmp	START
+		rjmp		STANDBY
 		//rcall Word_To_Data
 		rjmp	MAIN
 
@@ -257,38 +258,44 @@ HWAIT_INNER:
 ;*  USART Communication
 ;***********************************************************
 USART_Send:
-	lds		mpr, UCSR1A
-	sbrs	mpr, UDRE1
-	rjmp	USART_Send
-	sts		UDR1, choice
-	ret
+    lds		mpr, UCSR1A
+    sbrs	mpr, UDRE1              ; Wait for transmit buffer to be empty
+    rjmp	USART_Send
+    sts		UDR1, send              ; Send the data
+WAIT_TX:
+    lds		mpr, UCSR1A
+    sbrs	mpr, TXC1                ; Wait for transmission complete flag
+    rjmp	WAIT_TX
+    ret
 
 USART_Receive:
-	lds		mpr, UCSR1A
-	sbrs	mpr, RXC1
-	rjmp	USART_Receive
-	lds		opponent, UDR1
-	ret	
+    lds		mpr, UCSR1A
+    sbrs	mpr, RXC1                ; Wait until data is received
+    rjmp	USART_Receive
+    lds		opponent, UDR1           ; Store received data in opponent
+    ret
 
+USART_Receive_Interrupt:
+    push    mpr             ; Save working register
+    lds     mpr, UDR1       ; Read received data from USART
+    mov     receive, mpr    ; Store in receive register
+    pop     mpr             ; Restore working register
+    reti                    ; Return from interrupt
 
 STANDBY:
     WORD_TO_MEM Standby_START, Line1, 32  ; Display "Ready, Waiting"
-
-    ; Send "Ready" signal
-    ldi     mpr, SendReady         ; Load the ready signal
-    sts     UDR1, mpr              ; Send via USART
+	rcall LCDWRITE
+	
+	push send
+	ldi send, SendReady
+	rcall USART_SEND
+	pop send
 
 STANDBY_LOOP:
-    lds     mpr, UCSR1A            ; Load USART1 Status Register
-    sbrs    mpr, RXC1              ; Check if data is received
-    rjmp    STANDBY_LOOP           ; If no data received, loop
-
-    ; Receive opponent's ready signal
-    rcall   USART_Receive          
-    cpi     opponent, SendReady    ; Check if opponent sent "ready"
-    brne    STANDBY_LOOP           ; If not, keep waiting
-
-    rjmp    START                  ; Both boards are ready ? Start the game
+    cpi		receive, SendReady ; Check if opponent sent "Ready"
+    brne	STANDBY_LOOP       ; If not, keep waiting
+    
+	rjmp	START              ; If received, proceed
 
 
 
@@ -316,7 +323,7 @@ CHOICE_LOOP:
 	sbrc	mpr, 4
 	rjmp	CHOICE_LOOP
 
-	rjmp GAME_LOGIC
+	rjmp use_choice
 
 
 EDIT_CHOICE:
@@ -361,7 +368,6 @@ DISPLAY_SCISSORS:
 START_TIMER:
 	push	mpr
     ldi     waitcnt, 4          ; Set countdown to 4 steps (4 LEDs)
-	ldi		STAT, $00
 
     ; Load preload value
     ldi     mpr, PRELOAD_HIGH
@@ -372,6 +378,9 @@ START_TIMER:
     ; Enable Timer1 Overflow Interrupt
     ldi     mpr, (1 << TOIE1)
     sts     TIMSK1, mpr
+
+	ldi		mpr, (1 << CS12)	; Prescaler = 256
+	sts		TCCR1B, mpr
 
 	IN		mpr, PORTB
 	ANDI	mpr, $0F
@@ -405,7 +414,8 @@ TIMER1_INT:
     ; Disable Timer1 Interrupt
     ldi     mpr, 0x00
     sts     TIMSK1, mpr
-	ldi		stat, $FF
+	ldi     mpr, 0x00
+    sts     TCCR1B, mpr  ; Stop Timer1 completely
     rjmp    END_TIMER
 
 
@@ -424,6 +434,51 @@ END_TIMER:
     ret
 
 
+Use_Choice:
+	rcall USART_SEND
+
+Get_Opp:
+    //rcall USART_Receive      ; Wait for data to be received
+    rcall	START_TIMER
+
+Recieve_Loop:
+	cpi		opponent, 1
+	BREQ	DISPLAY_ROCK2
+	cpi		opponent, 2
+	BREQ	DISPLAY_PAPER2
+	cpi		opponent, 3
+	BREQ	DISPLAY_SCISSORS2
+	rjmp Recieve_Loop
+
+Suspense_Loop:
+	IN		mpr, PINB
+	ANDI	mpr, $F0
+	sbrc	mpr, 4
+	rjmp	SUSPENSE_LOOP
+
+	rjmp GAME_LOGIC
+	
+DISPLAY_ROCK2:
+		WORD_TO_MEM Rock_Start, Line1, 16
+		rcall LCDWrite
+		rcall HALF_SECOND_WAIT  ; Wait 500ms to prevent bouncing
+
+		rjmp	SUSPENSE_LOOP 
+
+DISPLAY_PAPER2:
+		WORD_TO_MEM PAPER_Start, Line1, 16
+		rcall LCDWrite
+		rcall HALF_SECOND_WAIT  ; Wait 500ms to prevent bouncing
+
+
+		rjmp	SUSPENSE_LOOP 
+
+DISPLAY_SCISSORS2:
+		WORD_TO_MEM Scissors_Start, Line1, 16
+		rcall LCDWrite
+		rcall HALF_SECOND_WAIT  ; Wait to prevent bouncing
+
+		rjmp	SUSPENSE_LOOP 
 
 GAME_LOGIC:	
 	sub  choice, opponent  ; choice - opponent
@@ -489,7 +544,6 @@ RESTART_GAME:
     ; Clear game variables
     ldi     choice, 1
     ldi     opponent, 1
-    clr     stat
     clr     waitcnt
 
     ; Reset LEDs
@@ -499,9 +553,6 @@ RESTART_GAME:
     ; Reset LCD with welcome message
     WORD_TO_MEM Welcome_START, Line1, 32
     rcall   LCDWrite
-
-    ; Reset the Ready Flag
-    clr     stat
 
     ; Jump back to main loop
     jmp    MAIN
